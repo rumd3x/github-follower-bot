@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -158,32 +160,52 @@ func githubThrottledExecutor() {
 		switch f := r.function; f {
 
 		case "following":
-			list, _, err := api.Users.ListFollowing(ctx(5), r.parameters[0].(string), nil)
-			if handleRateLimit(err) {
+			list, response, err := api.Users.ListFollowing(ctx(5), r.parameters[0].(string), nil)
+			retry := false
+			for handleRateLimit(response, err) {
+				retry = true
+				list, response, err = api.Users.ListFollowing(ctx(5), r.parameters[0].(string), nil)
+			}
+			if retry {
 				err = nil
 			}
 			r.response <- githubResponse{data: list, err: err}
 			close(r.response)
 
 		case "followers":
-			list, _, err := api.Users.ListFollowers(ctx(5), r.parameters[0].(string), nil)
-			if handleRateLimit(err) {
+			list, response, err := api.Users.ListFollowers(ctx(5), r.parameters[0].(string), nil)
+			retry := false
+			for handleRateLimit(response, err) {
+				retry = true
+				list, response, err = api.Users.ListFollowers(ctx(5), r.parameters[0].(string), nil)
+			}
+			if retry {
 				err = nil
 			}
 			r.response <- githubResponse{data: list, err: err}
 			close(r.response)
 
 		case "user":
-			user, _, err := api.Users.Get(ctx(5), r.parameters[0].(string))
-			if handleRateLimit(err) {
+			user, response, err := api.Users.Get(ctx(5), r.parameters[0].(string))
+			retry := false
+			for handleRateLimit(response, err) {
+				retry = true
+				user, response, err = api.Users.Get(ctx(5), r.parameters[0].(string))
+			}
+			if retry {
 				err = nil
 			}
 			r.response <- githubResponse{data: user, err: err}
 			close(r.response)
 
 		case "follow":
-			_, err := api.Users.Follow(ctx(5), r.parameters[0].(string))
-			if handleRateLimit(err) {
+			response, err := api.Users.Follow(ctx(5), r.parameters[0].(string))
+			retry := false
+			for handleRateLimit(response, err) {
+				retry = true
+				response, err = api.Users.Follow(ctx(5), r.parameters[0].(string))
+			}
+			if retry {
 				err = nil
 			}
 			r.response <- githubResponse{data: nil, err: err}
@@ -192,7 +214,8 @@ func githubThrottledExecutor() {
 	}
 }
 
-func handleRateLimit(err error) bool {
+func handleRateLimit(response *github.Response, err error) bool {
+
 	if rle, ok := err.(*github.RateLimitError); ok {
 		log.Println(rle.Message, rle.Rate)
 
@@ -209,6 +232,27 @@ func handleRateLimit(err error) bool {
 			}
 		}
 
+		return true
+	}
+
+	if response == nil {
+		return false
+	}
+
+	if response.StatusCode == http.StatusTooManyRequests {
+		log.Println("TooManyRequests", response.Header.Get("Retry-After"))
+		retryAfter, err := strconv.ParseInt(response.Header.Get("Retry-After"), 10, 64)
+		if err != nil {
+			retryAfter = 60
+		}
+		time.Sleep(time.Duration(retryAfter) * time.Second)
+
+		return true
+	}
+
+	if response.StatusCode >= 400 {
+		log.Println(response.Status)
+		time.Sleep(10 * time.Second)
 		return true
 	}
 
