@@ -73,10 +73,12 @@ func main() {
 		log.Println("requests remaining", currentRate.Core.Remaining)
 		log.Println("limit resets at", currentRate.Core.Reset)
 
-		following := getAllFollowing(me.GetLogin())
-		for _, f := range following {
-			wg.Add(1)
-			users <- f.GetLogin()
+		followingChan := getAllFollowing(me.GetLogin())
+		for following := range followingChan {
+			for _, f := range following {
+				wg.Add(1)
+				users <- f.GetLogin()
+			}
 		}
 
 		wg.Wait()
@@ -87,15 +89,17 @@ func followsExecutor(users <-chan string, wgParent *sync.WaitGroup) {
 	for u := range users {
 		var wg sync.WaitGroup
 
-		follows := getAllFollowers(u)
-		for _, f := range follows {
-			user := f.GetLogin()
-			if isOnDB(user) {
-				continue
-			}
+		followersChan := getAllFollowers(u)
+		for followers := range followersChan {
+			for _, f := range followers {
+				user := f.GetLogin()
+				if isOnDB(user) {
+					continue
+				}
 
-			wg.Add(1)
-			go followUser(user, &wg)
+				wg.Add(1)
+				go followUser(user, &wg)
+			}
 		}
 
 		wg.Wait()
@@ -125,29 +129,35 @@ func getUser(user string) *github.User {
 	return response.data.(*github.User)
 }
 
-func getAllFollowers(user string) []*github.User {
-	result := []*github.User{}
-	page := 1
-	buffer := getFollowers(user, page)
-	for len(buffer) == 100 {
-		result = append(result, buffer...)
-		page++
-		buffer = getFollowing(user, page)
-	}
-	result = append(result, buffer...)
+func getAllFollowers(user string) chan []*github.User {
+	result := make(chan []*github.User)
+	go func(chan<- []*github.User) {
+		page := 1
+		buffer := getFollowers(user, page)
+		for len(buffer) == 100 {
+			result <- buffer
+			page++
+			buffer = getFollowers(user, page)
+		}
+		result <- buffer
+		close(result)
+	}(result)
 	return result
 }
 
-func getAllFollowing(user string) []*github.User {
-	result := []*github.User{}
-	page := 1
-	buffer := getFollowing(user, page)
-	for len(buffer) == 100 {
-		result = append(result, buffer...)
-		page++
-		buffer = getFollowing(user, page)
-	}
-	result = append(result, buffer...)
+func getAllFollowing(user string) chan []*github.User {
+	result := make(chan []*github.User)
+	go func(chan<- []*github.User) {
+		page := 1
+		buffer := getFollowing(user, page)
+		for len(buffer) == 100 {
+			result <- buffer
+			page++
+			buffer = getFollowing(user, page)
+		}
+		result <- buffer
+		close(result)
+	}(result)
 	return result
 }
 
