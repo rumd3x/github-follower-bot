@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -45,7 +46,7 @@ func init() {
 	tc := oauth2.NewClient(context.Background(), ts)
 	api = github.NewClient(tc)
 
-	db, err := mongo.Connect(ctx(10), options.Client().ApplyURI(os.Getenv("MONGODB_URI")))
+	db, err := mongo.Connect(ctx(100), options.Client().ApplyURI(os.Getenv("MONGODB_URI")))
 
 	if err != nil {
 		log.Fatal(err)
@@ -61,10 +62,11 @@ func main() {
 	me := getUser("")
 	log.Println("user:", me.GetLogin())
 
-	workers := 5
+	workers := runtime.GOMAXPROCS(runtime.NumCPU())
 	var wg sync.WaitGroup
 	users := make(chan string)
 	for i := 0; i < workers; i++ {
+		log.Println("adding worker", i)
 		go followsExecutor(users, &wg)
 	}
 
@@ -73,12 +75,10 @@ func main() {
 		log.Println("requests remaining", currentRate.Core.Remaining)
 		log.Println("limit resets at", currentRate.Core.Reset)
 
-		followingChan := getAllFollowing(me.GetLogin())
-		for following := range followingChan {
-			for _, f := range following {
-				wg.Add(1)
-				users <- f.GetLogin()
-			}
+		following := getAllFollowing(me.GetLogin())
+		for f := range following {
+			wg.Add(1)
+			users <- f.GetLogin()
 		}
 
 		wg.Wait()
@@ -89,17 +89,15 @@ func followsExecutor(users <-chan string, wgParent *sync.WaitGroup) {
 	for u := range users {
 		var wg sync.WaitGroup
 
-		followersChan := getAllFollowers(u)
-		for followers := range followersChan {
-			for _, f := range followers {
-				user := f.GetLogin()
-				if isOnDB(user) {
-					continue
-				}
-
-				wg.Add(1)
-				go followUser(user, &wg)
+		followers := getAllFollowers(u)
+		for f := range followers {
+			user := f.GetLogin()
+			if isOnDB(user) {
+				continue
 			}
+
+			wg.Add(1)
+			go followUser(user, &wg)
 		}
 
 		wg.Wait()
@@ -129,33 +127,53 @@ func getUser(user string) *github.User {
 	return response.data.(*github.User)
 }
 
-func getAllFollowers(user string) chan []*github.User {
-	result := make(chan []*github.User)
-	go func(chan<- []*github.User) {
+func getAllFollowers(user string) chan *github.User {
+	result := make(chan *github.User)
+	go func(chan<- *github.User) {
 		page := 1
 		buffer := getFollowers(user, page)
+		var wg sync.WaitGroup
 		for len(buffer) == 100 {
-			result <- buffer
+			go func(result chan<- *github.User, buffer []*github.User, wg *sync.WaitGroup) {
+				for _, user := range buffer {
+					result <- user
+				}
+				wg.Done()
+			}(result, buffer, &wg)
+			wg.Add(1)
 			page++
 			buffer = getFollowers(user, page)
 		}
-		result <- buffer
+		for _, user := range buffer {
+			result <- user
+		}
+		wg.Wait()
 		close(result)
 	}(result)
 	return result
 }
 
-func getAllFollowing(user string) chan []*github.User {
-	result := make(chan []*github.User)
-	go func(chan<- []*github.User) {
+func getAllFollowing(user string) chan *github.User {
+	result := make(chan *github.User)
+	go func(chan<- *github.User) {
 		page := 1
 		buffer := getFollowing(user, page)
+		var wg sync.WaitGroup
 		for len(buffer) == 100 {
-			result <- buffer
+			go func(result chan<- *github.User, buffer []*github.User, wg *sync.WaitGroup) {
+				for _, user := range buffer {
+					result <- user
+				}
+				wg.Done()
+			}(result, buffer, &wg)
+			wg.Add(1)
 			page++
 			buffer = getFollowing(user, page)
 		}
-		result <- buffer
+		for _, user := range buffer {
+			result <- user
+		}
+		wg.Wait()
 		close(result)
 	}(result)
 	return result
@@ -213,11 +231,11 @@ func githubThrottledExecutor() {
 
 		case "following":
 			pagination.Page = r.parameters[1].(int)
-			list, response, err := api.Users.ListFollowing(ctx(5), r.parameters[0].(string), &pagination)
+			list, response, err := api.Users.ListFollowing(ctx(50), r.parameters[0].(string), &pagination)
 			retry := false
 			for handleRateLimit(response, err) {
 				retry = true
-				list, response, err = api.Users.ListFollowing(ctx(5), r.parameters[0].(string), nil)
+				list, response, err = api.Users.ListFollowing(ctx(50), r.parameters[0].(string), nil)
 			}
 			if retry {
 				err = nil
@@ -227,11 +245,11 @@ func githubThrottledExecutor() {
 
 		case "followers":
 			pagination.Page = r.parameters[1].(int)
-			list, response, err := api.Users.ListFollowers(ctx(5), r.parameters[0].(string), &pagination)
+			list, response, err := api.Users.ListFollowers(ctx(50), r.parameters[0].(string), &pagination)
 			retry := false
 			for handleRateLimit(response, err) {
 				retry = true
-				list, response, err = api.Users.ListFollowers(ctx(5), r.parameters[0].(string), nil)
+				list, response, err = api.Users.ListFollowers(ctx(50), r.parameters[0].(string), nil)
 			}
 			if retry {
 				err = nil
@@ -240,11 +258,11 @@ func githubThrottledExecutor() {
 			close(r.response)
 
 		case "user":
-			user, response, err := api.Users.Get(ctx(5), r.parameters[0].(string))
+			user, response, err := api.Users.Get(ctx(50), r.parameters[0].(string))
 			retry := false
 			for handleRateLimit(response, err) {
 				retry = true
-				user, response, err = api.Users.Get(ctx(5), r.parameters[0].(string))
+				user, response, err = api.Users.Get(ctx(50), r.parameters[0].(string))
 			}
 			if retry {
 				err = nil
@@ -253,11 +271,11 @@ func githubThrottledExecutor() {
 			close(r.response)
 
 		case "rate":
-			rate, response, err := api.RateLimits(ctx(5))
+			rate, response, err := api.RateLimits(ctx(50))
 			retry := false
 			for handleRateLimit(response, err) {
 				retry = true
-				rate, response, err = api.RateLimits(ctx(5))
+				rate, response, err = api.RateLimits(ctx(50))
 			}
 			if retry {
 				err = nil
@@ -266,11 +284,11 @@ func githubThrottledExecutor() {
 			close(r.response)
 
 		case "follow":
-			response, err := api.Users.Follow(ctx(5), r.parameters[0].(string))
+			response, err := api.Users.Follow(ctx(50), r.parameters[0].(string))
 			retry := false
 			for handleRateLimit(response, err) {
 				retry = true
-				response, err = api.Users.Follow(ctx(5), r.parameters[0].(string))
+				response, err = api.Users.Follow(ctx(50), r.parameters[0].(string))
 			}
 			if retry {
 				err = nil
@@ -287,14 +305,14 @@ func handleRateLimit(response *github.Response, err error) bool {
 	if rle, ok := err.(*github.RateLimitError); ok {
 		log.Println(rle.Message, rle.Rate)
 
-		rate, _, err := api.RateLimits(ctx(5))
+		rate, _, err := api.RateLimits(ctx(50))
 		if err != nil {
 			log.Fatalln("fatal error", err)
 		}
 
 		for rate.Core.Remaining < 1 {
 			time.Sleep(1 * time.Minute)
-			rate, _, err = api.RateLimits(ctx(5))
+			rate, _, err = api.RateLimits(ctx(50))
 			if err != nil {
 				log.Fatalln("fatal error", err)
 			}
@@ -331,13 +349,13 @@ func handleRateLimit(response *github.Response, err error) bool {
 
 func isOnDB(user string) bool {
 	var data bson.M
-	collection.FindOne(ctx(5), bson.M{"value": user}).Decode(&data)
+	collection.FindOne(ctx(50), bson.M{"value": user}).Decode(&data)
 	return (len(data) > 0)
 }
 
 func insertDB(user string) {
 	value := bson.M{"value": user}
-	collection.InsertOne(ctx(5), value)
+	collection.InsertOne(ctx(50), value)
 }
 
 // utils
