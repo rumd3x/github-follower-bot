@@ -21,6 +21,7 @@ import (
 var api *github.Client
 var collection *mongo.Collection
 var requests chan githubRequest
+var myFollowers []string
 
 type githubRequest struct {
 	function   string
@@ -59,6 +60,11 @@ func init() {
 }
 
 func main() {
+	runFollow()
+	// runUnfollow()
+}
+
+func runFollow() {
 	me := getUser("")
 	log.Println("user:", me.GetLogin())
 
@@ -68,6 +74,7 @@ func main() {
 	for i := 0; i < workers; i++ {
 		log.Println("adding worker", i)
 		go followsExecutor(users, &wg)
+		// go unfollowsExecutor(users, &wg)
 	}
 
 	for {
@@ -83,6 +90,46 @@ func main() {
 
 		wg.Wait()
 	}
+}
+
+func runUnfollow() {
+	me := getUser("")
+	log.Println("user:", me.GetLogin())
+
+	workers := runtime.GOMAXPROCS(runtime.NumCPU())
+	var wg sync.WaitGroup
+	users := make(chan string)
+	for i := 0; i < workers; i++ {
+		log.Println("adding worker", i)
+		go unfollowsExecutor(users, &wg)
+	}
+
+	myFollowers = []string{}
+	for f := range getAllFollowers(me.GetLogin()) {
+		myFollowers = append(myFollowers, f.GetLogin())
+	}
+	log.Printf("found %d followers\n", len(myFollowers))
+
+	cur, err := collection.Find(ctx(1000), bson.D{})
+
+	log.Println("populating jobs")
+	defer cur.Close(ctx(1000))
+	for cur.Next(ctx(1000)) {
+		var result bson.M
+		err = cur.Decode(&result)
+		if err != nil {
+			log.Fatal("erro decode", err)
+		}
+
+		users <- result["value"].(string)
+		wg.Add(1)
+	}
+
+	if err != nil {
+		log.Fatal("erro find", err)
+	}
+
+	wg.Wait()
 }
 
 func followsExecutor(users <-chan string, wgParent *sync.WaitGroup) {
@@ -105,12 +152,44 @@ func followsExecutor(users <-chan string, wgParent *sync.WaitGroup) {
 	}
 }
 
+func unfollowsExecutor(users <-chan string, wgParent *sync.WaitGroup) {
+	var wg sync.WaitGroup
+
+	for u := range users {
+
+		followsMe := false
+		for _, f := range myFollowers {
+			if f == u {
+				followsMe = true
+				continue
+			}
+		}
+
+		if !followsMe {
+			wg.Add(1)
+			go unfollowUser(u, &wg)
+		}
+	}
+
+	wg.Wait()
+	wgParent.Done()
+}
+
 func followUser(user string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	if follow(user) {
 		log.Println("followed:", user)
 		insertDB(user)
+	}
+}
+
+func unfollowUser(user string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	if unfollow(user) {
+		log.Println("unfollowed:", user)
+		deleteDB(user)
 	}
 }
 
@@ -209,6 +288,16 @@ func follow(user string) bool {
 	return true
 }
 
+func unfollow(user string) bool {
+	rchan := make(chan githubResponse)
+	requests <- githubRequest{function: "unfollow", parameters: []interface{}{user}, response: rchan}
+	response := <-rchan
+	if response.err != nil {
+		log.Fatalln("fatal error", response.err)
+	}
+	return true
+}
+
 func getRate() *github.RateLimits {
 	rchan := make(chan githubResponse)
 	requests <- githubRequest{function: "rate", parameters: nil, response: rchan}
@@ -296,6 +385,18 @@ func githubThrottledExecutor() {
 			r.response <- githubResponse{data: nil, err: err}
 			close(r.response)
 
+		case "unfollow":
+			response, err := api.Users.Unfollow(ctx(50), r.parameters[0].(string))
+			retry := false
+			for handleRateLimit(response, err) {
+				retry = true
+				response, err = api.Users.Unfollow(ctx(50), r.parameters[0].(string))
+			}
+			if retry || response.StatusCode == 404 {
+				err = nil
+			}
+			r.response <- githubResponse{data: nil, err: err}
+			close(r.response)
 		}
 	}
 }
@@ -305,17 +406,8 @@ func handleRateLimit(response *github.Response, err error) bool {
 	if rle, ok := err.(*github.RateLimitError); ok {
 		log.Println(rle.Message, rle.Rate)
 
-		rate, _, err := api.RateLimits(ctx(50))
-		if err != nil {
-			log.Fatalln("fatal error", err)
-		}
-
-		for rate.Core.Remaining < 1 {
+		for time.Now().Before(rle.Rate.Reset.Time) {
 			time.Sleep(1 * time.Minute)
-			rate, _, err = api.RateLimits(ctx(50))
-			if err != nil {
-				log.Fatalln("fatal error", err)
-			}
 		}
 
 		return true
@@ -334,6 +426,11 @@ func handleRateLimit(response *github.Response, err error) bool {
 		time.Sleep(time.Duration(retryAfter) * time.Second)
 
 		return true
+	}
+
+	if response.StatusCode == 404 {
+		log.Println(response.Status)
+		return false
 	}
 
 	if response.StatusCode >= 400 {
@@ -356,6 +453,11 @@ func isOnDB(user string) bool {
 func insertDB(user string) {
 	value := bson.M{"value": user}
 	collection.InsertOne(ctx(50), value)
+}
+
+func deleteDB(user string) {
+	value := bson.M{"value": user}
+	collection.DeleteOne(ctx(50), value)
 }
 
 // utils
