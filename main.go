@@ -60,8 +60,8 @@ func init() {
 }
 
 func main() {
-	runFollow()
-	// runUnfollow()
+	// runFollow()
+	runUnfollow()
 }
 
 func runFollow() {
@@ -168,6 +168,15 @@ func unfollowsExecutor(users <-chan string, wgParent *sync.WaitGroup) {
 		if !followsMe {
 			wg.Add(1)
 			go unfollowUser(u, &wg)
+			continue
+		}
+
+		gitHubUser := getUser(u)
+		rate := *gitHubUser.Following / *gitHubUser.Followers
+		if rate >= 5 {
+			wg.Add(1)
+			go unfollowUser(u, &wg)
+			continue
 		}
 	}
 
